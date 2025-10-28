@@ -26,10 +26,10 @@ share/python-wheels/
 *.egg
 MANIFEST
 
-# Baseline diresctory 
-dpo_toxic-main/
-DPO_LoRA_Baseline.ipynb
-ASC_copy/
+# API / 
+env_example.txt
+baseline_llama.sbatch
+
 
 # PyInstaller
 #  Usually these files are written by a python script from a template

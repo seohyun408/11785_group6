@@ -1,9 +1,8 @@
+"""
+Configuration for Mistral-7B experiment
+"""
 import os
 from typing import Dict, Any
-
-# =============================================================================
-# Configuration Dictionaries
-# =============================================================================
 
 # API 
 API_CONFIG = {
@@ -11,35 +10,31 @@ API_CONFIG = {
     'wandb_token': os.getenv('WANDB_TOKEN'),
 }
 
-# Model
+# Model - Mistral-7B
 MODEL_CONFIG = {
-    'model_name': "mistralai/Mistral-7B-Instruct-v0.2", # Original model
-    'new_model': "/scratch/tjgus0408/mistral-7B-instruct-dpo", # New DPO model (Train!)
-    'my_dpo_model': "/scratch/tjgus0408/mistral-7B-instruct-dpo", # Pre-trained DPO model
-    'hub_model_name': "mistral-7B-instruct-dpo",  # Hub upload model
+    'model_name': "mistralai/Mistral-7B-Instruct-v0.2",
+    'new_model': "/ocean/projects/cis250219p/slee37/mistral-7B-instruct-dpo",
+    'my_dpo_model': "/ocean/projects/cis250219p/slee37/mistral-7B-instruct-dpo",
+    'hub_model_name': "mistral-7B-instruct-dpo",
     'enable_hub_upload': False,  
 }
 
 # Training
 TRAINING_CONFIG = {
-    'per_device_train_batch_size': 4,
-    'gradient_accumulation_steps': 8,
+    'per_device_train_batch_size': 16,
+    'gradient_accumulation_steps': 2,
     'learning_rate': 5e-5,
     'max_steps': 300,
-    'max_prompt_length': 768,
-    'max_length': 1024,
+    'max_prompt_length': 512,
+    'max_length': 768,
 }
 
 # LoRA 
 LORA_CONFIG = {
-    'r': 16,
-    'alpha': 16,
+    'r': 8,
+    'alpha': 32,
     'dropout': 0.05,
 }
-
-# =============================================================================
-# Utility Functions
-# =============================================================================
 
 def validate_tokens() -> bool:
     """Validate that required API tokens are available."""
