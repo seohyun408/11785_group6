@@ -22,7 +22,7 @@ from detoxify import Detoxify
 import warnings
 warnings.filterwarnings("ignore")
 
-from huggingface_hub import login
+import torch.distributed as dist
 
 
 # =============================================================================
@@ -50,14 +50,51 @@ def main():
     # =============================================================================
     # MULTI-GPU SETUP
     # =============================================================================
+    
+    def setup_ddp():
+        """Initialize DDP if running in distributed mode."""
+        if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
+            rank = int(os.environ['RANK'])
+            world_size = int(os.environ['WORLD_SIZE'])
+            local_rank = int(os.environ.get('LOCAL_RANK', 0))
 
-    os.environ["CUDA_VISIBLE_DEVICES"] = "0,1,2,3,4,5,6,7"  
-    torch.cuda.set_device(0)  # Set primary GPU
+            # Set CUDA device BEFORE initializing the process group
+            if torch.cuda.is_available():
+                torch.cuda.set_device(local_rank)
 
-    print(f"Available GPUs: {torch.cuda.device_count()}")
-    for i in range(torch.cuda.device_count()):
-        print(f"GPU {i}: {torch.cuda.get_device_name(i)}")
+            # Ensure rendezvous address/port exist (torchrun usually provides these)
+            os.environ.setdefault('MASTER_ADDR', os.environ.get('MASTER_ADDR', '127.0.0.1'))
+            os.environ.setdefault('MASTER_PORT', os.environ.get('MASTER_PORT', '29500'))
 
+            if not dist.is_initialized():
+                dist.init_process_group(
+                    backend='nccl',
+                    init_method='env://',
+                    world_size=world_size,
+                    rank=rank
+                )
+            
+            # Verify initialization was successful
+            if dist.is_initialized():
+                print(f"DDP initialized successfully: rank={rank}, world_size={world_size}, local_rank={local_rank}")
+            
+            return True, rank, world_size, local_rank
+        else:
+            print('Not using distributed mode')
+            return False, 0, 1, 0
+
+    use_ddp, rank, world_size, local_rank = setup_ddp()
+    # if LOCAL_RANK == 0:
+    if use_ddp:
+        print(f"Using DDP with {world_size} processes, rank {rank}, local_rank {local_rank}")
+        if rank == 0:
+            print(f"Available GPUs: {torch.cuda.device_count()}")
+            for i in range(torch.cuda.device_count()):
+                print(f"GPU {i}: {torch.cuda.get_device_name(i)}")
+    else:
+        print(f"Available GPUs: {torch.cuda.device_count()}")
+        for i in range(torch.cuda.device_count()):
+            print(f"GPU {i}: {torch.cuda.get_device_name(i)}")
 
 
     # =============================================================================
@@ -67,7 +104,29 @@ def main():
     hf_token = API_CONFIG['huggingface_token']
 
     # Initialize wandb only on main process
-    wandb.login(key=API_CONFIG['wandb_token'])
+    if not use_ddp or rank == 0:
+        wandb.login(key=API_CONFIG['wandb_token'])
+        
+        if LLM_model.lower() == 'mistral':
+            run_name = f"Baseline--mistral7B"
+        elif LLM_model.lower() == 'qwen':
+            run_name = f"Baseline--qwen2.5-7B"
+        elif LLM_model.lower() == 'llama':
+            run_name = f"Baseline--llama3.1-8B"
+        
+        wandb.init(
+            project="IDL_11785_group6",
+            name=run_name,
+            config={
+                "model_name": MODEL_CONFIG['model_name'],
+                "new_model": MODEL_CONFIG['new_model'],
+                "training_config": TRAINING_CONFIG,
+                "lora_config": LORA_CONFIG,
+                "num_epochs": 5,
+                "learning_rate": TRAINING_CONFIG['learning_rate'],
+                "batch_size": TRAINING_CONFIG['per_device_train_batch_size'],
+            }
+        )
 
     if LLM_model == 'mistral':
         run_name = f"Baseline--mistral7B"
@@ -76,19 +135,6 @@ def main():
     elif LLM_model == 'llama':
         run_name = f"Baseline--llama3.1-8B"
 
-    wandb.init(
-        project="IDL_11785_group6",
-        name=run_name,
-        config={
-            "model_name": MODEL_CONFIG['model_name'],
-            "new_model": MODEL_CONFIG['new_model'],
-            "training_config": TRAINING_CONFIG,
-            "lora_config": LORA_CONFIG,
-            "num_epochs": 5,
-            "learning_rate": TRAINING_CONFIG['learning_rate'],
-            "batch_size": TRAINING_CONFIG['per_device_train_batch_size'],
-        }
-    )
 
     # =============================================================================
     # Functions
@@ -179,10 +225,27 @@ def main():
     # DATASET
     # =============================================================================
 
-    train_dataset = get_hh("train", sanity_check=False)
-    eval_dataset = get_hh("test", sanity_check=False)
+    if use_ddp:
+        if rank == 0:
+            train_dataset = get_hh("train", sanity_check=False)
+            eval_dataset = get_hh("test", sanity_check=False)
+        if dist.is_initialized():
+            # Use explicit device_ids to avoid NCCL choosing an unknown device
+            try:
+                dist.barrier(device_ids=[local_rank])
+            except TypeError:
+                # Older PyTorch: fall back to default barrier
+                dist.barrier()
+        if rank != 0:
+            train_dataset = get_hh("train", sanity_check=False)
+            eval_dataset = get_hh("test", sanity_check=False)
+    else:
+        train_dataset = get_hh("train", sanity_check=False)
+        eval_dataset = get_hh("test", sanity_check=False)
     eval_dataset = eval_dataset.select(range(1000))
 
+    train_dataset = train_dataset.with_format("torch")
+    eval_dataset = eval_dataset.with_format("torch")
 
 
     # =============================================================================
@@ -198,8 +261,11 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "left"
+    
+    # Get token IDs from tokenizer to align with model config
+    pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
+    eos_token_id = tokenizer.eos_token_id
 
-    # Configure BitsAndBytesConfig for 4-bit quantization
     bnb_config = BitsAndBytesConfig(
         load_in_4bit=True,
         bnb_4bit_quant_type="nf4",
@@ -207,55 +273,90 @@ def main():
         bnb_4bit_use_double_quant=True,
     )
 
-    # Load model with multi-GPU support
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
         quantization_config=bnb_config,
         torch_dtype=torch.float16,
-        device_map="auto",  # Automatically distribute across available GPUs
+        device_map=None if use_ddp else "auto",
+        low_cpu_mem_usage=True,
+        attn_implementation='sdpa',
         trust_remote_code=True
     )
     model.config.use_cache = False
+    # Align model config with tokenizer tokens to avoid warnings
+    if hasattr(model.config, 'pad_token_id'):
+        model.config.pad_token_id = pad_token_id
+    if hasattr(model.config, 'eos_token_id'):
+        model.config.eos_token_id = eos_token_id
+    if hasattr(model.config, 'bos_token_id') and tokenizer.bos_token_id is not None:
+        model.config.bos_token_id = tokenizer.bos_token_id
 
-    # Reference model for KL-divergence calculation
     ref_model = AutoModelForCausalLM.from_pretrained(
         model_name,
         quantization_config=bnb_config,
         torch_dtype=torch.float16,
-        device_map="auto",  # Automatically distribute across available GPUs
+        device_map=None if use_ddp else "auto",
         trust_remote_code=True
     )
     ref_model.config.use_cache = False
+    # Align reference model config with tokenizer tokens
+    if hasattr(ref_model.config, 'pad_token_id'):
+        ref_model.config.pad_token_id = pad_token_id
+    if hasattr(ref_model.config, 'eos_token_id'):
+        ref_model.config.eos_token_id = eos_token_id
+    if hasattr(ref_model.config, 'bos_token_id') and tokenizer.bos_token_id is not None:
+        ref_model.config.bos_token_id = tokenizer.bos_token_id
 
 
     # =============================================================================
     # Training arguments
     # =============================================================================
 
-    training_args = DPOConfig(
-        per_device_train_batch_size=TRAINING_CONFIG['per_device_train_batch_size'],
-        gradient_accumulation_steps=TRAINING_CONFIG['gradient_accumulation_steps'],
-        gradient_checkpointing=True,
-        learning_rate=TRAINING_CONFIG['learning_rate'],
-        lr_scheduler_type="cosine",
-        num_train_epochs=5, 
-        save_strategy="epoch",
-        logging_steps=100,
-        output_dir=MODEL_CONFIG['new_model'],
-        optim="paged_adamw_32bit",
-        warmup_steps=50,
-        bf16=True,
-        beta=0.1,
-        max_prompt_length=TRAINING_CONFIG['max_prompt_length'],
-        max_length=TRAINING_CONFIG['max_length'],
-        report_to="wandb",
-        ddp_find_unused_parameters=False,
-        dataloader_pin_memory=True,
-        dataloader_num_workers=4,
+    # Ensure DDP is initialized before creating DPOConfig (it checks world_size internally)
+    if use_ddp and not dist.is_initialized():
+        print("Warning: DDP environment variables detected but init_process_group not called. Re-initializing...")
+        dist.init_process_group(
+            backend='nccl',
+            init_method='env://',
+            world_size=world_size,
+            rank=rank
+        )
 
-    )
+    # Base training arguments (always required)
+    base_args = {
+        'per_device_train_batch_size': TRAINING_CONFIG['per_device_train_batch_size'],
+        'gradient_accumulation_steps': TRAINING_CONFIG['gradient_accumulation_steps'],
+        'gradient_checkpointing': True,
+        'learning_rate': TRAINING_CONFIG['learning_rate'],
+        'lr_scheduler_type': "cosine",
+        'num_train_epochs': 1,
+        'save_strategy': "epoch",
+        'logging_steps': 100,
+        'output_dir': MODEL_CONFIG['new_model'],
+        'optim': "paged_adamw_32bit",
+        'warmup_steps': 50,
+        'bf16': torch.cuda.is_bf16_supported(),
+        'beta': 0.1,
+        'max_prompt_length': TRAINING_CONFIG['max_prompt_length'],
+        'max_length': TRAINING_CONFIG['max_length'],
+        'report_to': "wandb" if (not use_ddp or rank == 0) else None,
+        'dataloader_pin_memory': True,
+        'dataloader_num_workers': min(4, os.cpu_count() or 4),
+        'dataloader_drop_last': True,
+        'remove_unused_columns': False,
+    }
 
-    # LoRA configuration
+    # DDP-specific arguments (only when DDP is enabled)
+    if use_ddp:
+        base_args.update({
+            'ddp_backend': "nccl",
+            'ddp_find_unused_parameters': False,
+            'local_rank': local_rank,
+            'ddp_timeout': 1800,
+        })
+
+    training_args = DPOConfig(**base_args)
+
     peft_config = LoraConfig(
         r=LORA_CONFIG['r'],
         lora_alpha=LORA_CONFIG['alpha'],
@@ -265,7 +366,6 @@ def main():
         target_modules=['k_proj', 'gate_proj', 'v_proj', 'up_proj', 'q_proj', 'o_proj', 'down_proj']
     )
 
-    # Initialize DPO trainer with reference model
     dpo_trainer = DPOTrainer(
         model,
         ref_model=None, #ref_model,
@@ -302,10 +402,10 @@ def main():
                     sample_texts=self.sample_texts
                 )
                 
-                wandb.log({
-                    "epoch": state.epoch,
-                    "kl_divergence": kl_div
-                })
+                # wandb.log({
+                #     "epoch": state.epoch,
+                #     "kl_divergence": kl_div
+                # })
                 
                 print(f"Epoch {state.epoch}: KL-divergence = {kl_div:.4f}")
 
@@ -316,26 +416,33 @@ def main():
 
     print("Starting DPO training...")
     new_model = MODEL_CONFIG['new_model']
-    hf_token = API_CONFIG['huggingface_token']
 
-    # Initialize multi-GPU training
-    if torch.cuda.device_count() > 1:
+    if use_ddp:
+        print(f"Using DDP with {world_size} processes for training")
+        torch.cuda.empty_cache()
+        gc.collect()
+    elif torch.cuda.device_count() > 1:
         print(f"Using {torch.cuda.device_count()} GPUs for training")
-        # Set up distributed training if needed
         torch.cuda.empty_cache()
         gc.collect()
 
-    # Add KL-divergence callback
-    kl_callback = KLDivergenceCallback(ref_model, tokenizer, sample_texts)
-    dpo_trainer.add_callback(kl_callback)
+    if not use_ddp or rank == 0:
+        kl_callback = KLDivergenceCallback(ref_model, tokenizer, sample_texts)
+        dpo_trainer.add_callback(kl_callback)
 
-    # Fine-tune model with DPO
     dpo_trainer.train()
 
     # Save artifacts
-    dpo_trainer.model.save_pretrained(checkpoint_dir)
-    tokenizer.save_pretrained(checkpoint_dir)
-    print(f"Model checkpoint saved to: {checkpoint_dir}")
+    if not use_ddp or rank == 0:
+        checkpoint_dir = f"/ocean/projects/cis250219p/slee37/final_checkpoint/{LLM_model}"
+        os.makedirs(checkpoint_dir, exist_ok=True)
+        dpo_trainer.model.save_pretrained(checkpoint_dir)
+        tokenizer.save_pretrained(checkpoint_dir)
+        print(f"Model checkpoint saved to: {checkpoint_dir}")
+    
+        # Wait for all processes to finish saving
+        if use_ddp:
+            dist.barrier()
 
     del dpo_trainer, model
     gc.collect()
@@ -345,9 +452,16 @@ def main():
     base_model = AutoModelForCausalLM.from_pretrained(
         model_name,
         return_dict=True,
-        torch_dtype=torch.float16,
+        dtype=torch.float16,
     )
     tokenizer = AutoTokenizer.from_pretrained(model_name)
+    # Align tokenizer and model config
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    if hasattr(base_model.config, 'pad_token_id'):
+        base_model.config.pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
+    if hasattr(base_model.config, 'eos_token_id'):
+        base_model.config.eos_token_id = tokenizer.eos_token_id
 
     # Merge base model with the adapter
     model = PeftModel.from_pretrained(base_model, checkpoint_dir)
@@ -372,9 +486,16 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(new_model)
     model = AutoModelForCausalLM.from_pretrained(
         new_model,
-        torch_dtype=torch.float16,
+        dtype=torch.float16,
         device_map="auto"
     )
+    # Align tokenizer and model config
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    if hasattr(model.config, 'pad_token_id'):
+        model.config.pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
+    if hasattr(model.config, 'eos_token_id'):
+        model.config.eos_token_id = tokenizer.eos_token_id
     print(f"Successfully loaded model from: {new_model}")
 
     prompt = tokenizer.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
@@ -419,18 +540,15 @@ def main():
 
         return outputs[0]["generated_text"]
 
-    # Generate outputs
     base_model_generations = []
     for toxic_prompt in tqdm(toxic_prompt_list, desc=f"Generating for base model generation"):
         output = generate_output_from_prompt(toxic_prompt, pipeline)
         base_model_generations.append(output)
 
-    # Extract only completions
     base_model_generations_only_completions = []
     for generation in base_model_generations:
         base_model_generations_only_completions.append(generation.split("[/INST]")[-1])
         
-    # Evaluate toxicity
     detoxify_model = Detoxify('original')
 
     toxicity_scores = []
@@ -454,7 +572,7 @@ def main():
     orig_model = AutoModelForCausalLM.from_pretrained(
         model_name,
         load_in_4bit=True,
-        torch_dtype=torch.float16
+        dtype=torch.float16
     )
 
     orig_model.config.use_cache = True
@@ -463,6 +581,13 @@ def main():
         {"role": "user", "content": "What is a Large Language Model?"}
     ]
     tokenizer = AutoTokenizer.from_pretrained(model_name)
+    # Align tokenizer and model config
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    if hasattr(orig_model.config, 'pad_token_id'):
+        orig_model.config.pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
+    if hasattr(orig_model.config, 'eos_token_id'):
+        orig_model.config.eos_token_id = tokenizer.eos_token_id
     prompt = tokenizer.apply_chat_template(message, add_generation_prompt=True, tokenize=False)
 
     orig_pipeline = transformers.pipeline(
@@ -509,7 +634,7 @@ def main():
 
     dpo_model = AutoModelForCausalLM.from_pretrained(
         my_dpo_model,
-        torch_dtype=torch.float16,
+        dtype=torch.float16,
         load_in_4bit=True
     )
     dpo_model.config.use_cache = True
@@ -518,6 +643,13 @@ def main():
         {"role": "user", "content": "What is a Large Language Model?"}
     ]
     tokenizer = AutoTokenizer.from_pretrained(my_dpo_model)
+    # Align tokenizer and model config
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    if hasattr(dpo_model.config, 'pad_token_id'):
+        dpo_model.config.pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
+    if hasattr(dpo_model.config, 'eos_token_id'):
+        dpo_model.config.eos_token_id = tokenizer.eos_token_id
     prompt = tokenizer.apply_chat_template(message, add_generation_prompt=True, tokenize=False)
 
     dpo_pipeline = transformers.pipeline(

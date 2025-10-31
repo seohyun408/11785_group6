@@ -4,11 +4,12 @@
 
 # API / SBATCH file 
 api_key
-config_local.py
+config_mistral.py
+config_qwen.py
 secrets.py
 run.sbatch
 dataset_info.py
-env_example.txt
+env.txt
 
 # Model checkpoints and outputs
 final_checkpoint/

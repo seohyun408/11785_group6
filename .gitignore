@@ -27,7 +27,7 @@ share/python-wheels/
 MANIFEST
 
 # API / 
-env_example.txt
+env.txt
 baseline_llama.sbatch
 
 

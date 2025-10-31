@@ -21,7 +21,7 @@ MODEL_CONFIG = {
 
 # Training
 TRAINING_CONFIG = {
-    'per_device_train_batch_size': 8,
+    'per_device_train_batch_size': 6,
     'gradient_accumulation_steps': 4,
     'learning_rate': 5e-5,
     'max_steps': 300,
