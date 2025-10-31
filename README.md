@@ -7,12 +7,14 @@
 
 
 ## Directory Structure
-ASC/
-├── baseline/
-│ ├── baseline.py 
-│ └── config.py
-├── model/
-└── utils/
+```
+ASC/    
+├── baseline/    
+│ ├── baseline.py     
+│ └── config.py    
+├── model/    
+└── utils/    
+```
 
 
 ## Baseline code
